@@ -2,15 +2,19 @@ package $package$
 
 import java.util.UUID
 
-import akka.Done
 import akka.actor.ActorSystem
-import akka.kafka.scaladsl.{Consumer, Producer}
-import akka.kafka.{ConsumerSettings, ProducerMessage, ProducerSettings, Subscriptions}
-import akka.stream.{ActorMaterializer, Materializer}
+import akka.kafka.ConsumerMessage.{ CommittableMessage, CommittableOffset }
+import akka.kafka.ProducerMessage.Message
+import akka.kafka.scaladsl.{ Consumer, Producer }
+import akka.kafka.{ ConsumerSettings, ProducerMessage, ProducerSettings, Subscriptions }
+import akka.stream.scaladsl.Flow
+import akka.stream.{ ActorMaterializer, Materializer }
+import akka.{ Done, NotUsed }
+import com.sksamuel.avro4s.RecordFormat
+import org.apache.avro.generic.GenericRecord
 import org.apache.kafka.clients.producer.ProducerRecord
-import org.apache.kafka.common.serialization.{Deserializer, Serializer}
 import play.api.libs.ws.WSClient
-import play.api.libs.ws.ahc.{AhcWSClient, AhcWSClientConfig}
+import play.api.libs.ws.ahc.{ AhcWSClient, AhcWSClientConfig }
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
@@ -20,21 +24,22 @@ object Main extends App {
   type Key = String
   implicit val system: ActorSystem = ActorSystem()
   implicit val mat: Materializer = ActorMaterializer()
+  val ws = AhcWSClient(AhcWSClientConfig(maxRequestRetry = 0))(mat)
 
-  def producerSettings[K, V](system: ActorSystem, keySerializer: Option[Serializer[K]], valueSerializer: Option[Serializer[V]]): ProducerSettings[K, V] =
-    ProducerSettings(system, keySerializer, valueSerializer)
-      .withBootstrapServers("localhost:9092")
+  val producerSettings: ProducerSettings[Key, GenericRecord] =
+    ProducerSettings(system, None, None)
 
-  def consumerSettings[K, V](system: ActorSystem, keySerializer: Option[Deserializer[K]], valueSerializer: Option[Deserializer[V]]) = {
-    ConsumerSettings(system, keySerializer, valueSerializer)
-      .withBootstrapServers("localhost:9092")
-  }
+  val consumerSettings: ConsumerSettings[Key, GenericRecord] =
+    ConsumerSettings(system, None, None)
 
-  def recordFlow[Value](implicit recordFormat: RecordFormat[Value]): Flow[(Topic, Key, Value), ProducerRecord[Key, GenericRecord], NotUsed] =
-    Flow[(Topic, Key, Value)].map {
-      case (topic, key, value) =>
-        new ProducerRecord(topic, key, recordFormat.to(value))
+  def mapToAvro[Value](implicit recordFormat: RecordFormat[Value]): Flow[(CommittableMessage[String, GenericRecord], (Topic, Key, Value)), Message[Key, GenericRecord, CommittableOffset], NotUsed] =
+    Flow[(CommittableMessage[Key, GenericRecord], (Topic, Key, Value))].map {
+      case (committable, (topic, key, value)) =>
+        ProducerMessage.Message(new ProducerRecord[Key, GenericRecord](topic, key, recordFormat.to(value)), committable.committableOffset)
     }
+
+  def parseFromAvro[Value](implicit recordFormat: RecordFormat[Value]): Flow[CommittableMessage[Key, GenericRecord], (CommittableMessage[Key, GenericRecord], Value), NotUsed] =
+    Flow[CommittableMessage[Key, GenericRecord]].map(record => (record, recordFormat.from(record.record.value())))
 
   def randomId: String = UUID.randomUUID.toString
 
@@ -44,22 +49,31 @@ object Main extends App {
     implicit val recordFormat = RecordFormat[PersonCreated]
   }
 
-  def callGoogle(ws: WSClient): Future[String] = {
-    ws.url("https://www.google.nl").get().map(_.body)
+  final case class GoogleResponse(response: String)
+  object GoogleResponse {
+    implicit val recordFormat = RecordFormat[GoogleResponse]
   }
 
-  def getGoogleData: Future[Done] = {
-    Consumer.committableSource(consumerSettings[String, String](system, None, None), Subscriptions.topics("PersonCreatedAvro"))
-      .mapAsync(1) { msg =>
-        callGoogle(ws)
-          .map(response => (msg, response))
+  def callGoogle(ws: WSClient): Future[GoogleResponse] = {
+    ws.url("https://www.google.nl").get().map(_.body).map(GoogleResponse.apply)
+  }
+
+  def process: Future[Done] = {
+    Consumer.committableSource(consumerSettings, Subscriptions.topics("PersonCreatedAvro"))
+      .via(parseFromAvro[PersonCreated])
+      .mapAsync(1) {
+        case (committable, personCreated) =>
+          callGoogle(ws).map(resp => (committable, resp, personCreated.id))
       }.map {
-      case (msg, response) => ProducerMessage.Message(new ProducerRecord[String, String]("GoogleResponsesAvro", response), msg.committableOffset)
-    }.runWith(Producer.commitableSink(producerSettings(system, None, None)))
+      case (committable, response, id) =>
+        (committable, ("GoogleResponsesAvro", id, response))
+    }
+      .via(mapToAvro)
+      .runWith(Producer.commitableSink(producerSettings))
   }
 
   (for {
-    _ <- getGoogleData
+    _ <- process
     _ <- system.terminate()
   } yield println("done")).recoverWith {
     case t: Throwable =>
